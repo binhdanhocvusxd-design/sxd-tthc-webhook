@@ -1,29 +1,40 @@
+// index.js
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 import Fuse from "fuse.js";
 import _ from "lodash";
 
+/** =========================
+ *  CONFIG
+ *  ========================= */
 const SHEET_ID = process.env.SHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "TTHC";
 
+// thời gian cache: 5 phút
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+// ngưỡng fuzzy (có thể chỉnh 0.45–0.55 tùy dữ liệu)
+const FUSE_THRESHOLD = 0.5;
+
+/** =========================
+ *  APP
+ *  ========================= */
 const app = express();
 app.use(bodyParser.json());
 
-// --- Helpers ---
-const removeVietnameseTones = (str) => {
-  if (!str) return "";
-  return str
+/** =========================
+ *  UTIL
+ *  ========================= */
+const removeVietnameseTones = (str = "") =>
+  str
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // bỏ dấu
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/đ/g, "d")
     .replace(/Đ/g, "D")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
-};
-
-let cache = { rows: [], fuse: null, lastLoad: 0 };
 
 const COLUMN_MAP = {
   ma_thu_tuc: "ma_thu_tuc",
@@ -45,30 +56,49 @@ const COLUMN_MAP = {
   dieu_kien: "dieu_kien",
 };
 
-const INFO_KEY_TO_COL = {
-  thoi_gian: "thoi_han",
-  thoi_han: "thoi_han",
-  trinh_tu: "trinh_tu",
-  le_phi: "phi_le_phi",
-  phi_le_phi: "phi_le_phi",
-  thanh_phan_hs: "thanh_phan_hs",
-  ho_so: "thanh_phan_hs",
-  doi_tuong: "doi_tuong",
-  co_quan: "co_quan_thuc_hien",
-  noi_nop: "noi_tiep_nhan",
-  ket_qua: "ket_qua",
-  can_cu: "can_cu",
-  dieu_kien: "dieu_kien",
-  hinh_thuc_nop: "hinh_thuc_nop",
-  linh_vuc: "linh_vuc",
-  cap_thuc_hien: "cap_thuc_hien",
-  loai_thu_tuc: "loai_thu_tuc",
+const INFO_KEY_TO_LABEL = {
+  thanh_phan_hs: "🗂️ Thành phần hồ sơ",
+  thoi_han: "⏱️ Thời hạn giải quyết",
+  trinh_tu: "🧭 Trình tự thực hiện",
+  phi_le_phi: "💳 Phí, lệ phí",
+  noi_tiep_nhan: "📍 Nơi tiếp nhận",
+  co_quan_thuc_hien: "🏢 Cơ quan thực hiện",
+  doi_tuong: "👥 Đối tượng",
+  ket_qua: "📄 Kết quả",
+  can_cu: "⚖️ Căn cứ pháp lý",
+  dieu_kien: "✅ Điều kiện",
+  hinh_thuc_nop: "🌐 Hình thức nộp",
+  linh_vuc: "📚 Lĩnh vực",
+  cap_thuc_hien: "🏷️ Cấp thực hiện",
+  loai_thu_tuc: "🧾 Loại thủ tục",
 };
 
-// --- Load Google Sheet vào cache ---
+// Những cột được coi là “thông tin chi tiết” để tạo chip
+const DETAIL_COLS = [
+  "thanh_phan_hs",
+  "thoi_han",
+  "trinh_tu",
+  "phi_le_phi",
+  "noi_tiep_nhan",
+  "co_quan_thuc_hien",
+  "doi_tuong",
+  "ket_qua",
+  "can_cu",
+  "dieu_kien",
+  "hinh_thuc_nop",
+];
+
+let cache = {
+  lastLoad: 0,
+  rows: [],
+  fuse: null,
+};
+
 async function loadSheet() {
   const now = Date.now();
-  if (now - cache.lastLoad < 5 * 60 * 1000 && cache.rows.length) return;
+  if (now - cache.lastLoad < CACHE_TTL_MS && cache.rows.length) return;
+
+  if (!SHEET_ID) throw new Error("SHEET_ID env is missing");
 
   const auth = await google.auth.getClient({
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
@@ -81,161 +111,225 @@ async function loadSheet() {
     range,
   });
 
-  const [header, ...rows] = data.values || [];
-  const idx = Object.fromEntries(header.map((h, i) => [h, i]));
+  const [header = [], ...rows] = data.values || [];
+  const colIdx = Object.fromEntries(header.map((h, i) => [h, i]));
+
   const toObj = (r) =>
     Object.fromEntries(
-      Object.keys(COLUMN_MAP).map((k) => [k, r?.[idx[k]] || ""])
+      Object.keys(COLUMN_MAP).map((k) => [k, r[colIdx[k]] || ""])
     );
 
-  const parsed = rows.map(toObj).filter((r) => r.thu_tuc);
-  parsed.forEach((r) => (r._thu_tuc_norm = removeVietnameseTones(r.thu_tuc)));
+  const parsed = rows
+    .map(toObj)
+    .filter((r) => r.thu_tuc && r.ma_thu_tuc)
+    .map((r) => ({ ...r, _thu_tuc_norm: removeVietnameseTones(r.thu_tuc) }));
 
   const fuse = new Fuse(parsed, {
-    keys: ["thu_tuc", "_thu_tuc_norm"],
+    keys: [
+      "thu_tuc",
+      "_thu_tuc_norm",
+      "ma_thu_tuc",
+      "linh_vuc",
+      "loai_thu_tuc",
+      "cap_thuc_hien",
+    ],
     includeScore: true,
-    threshold: 0.42,
+    threshold: FUSE_THRESHOLD,
     ignoreLocation: true,
-    minMatchCharLength: 3,
+    minMatchCharLength: 2,
   });
 
-  cache = { rows: parsed, fuse, lastLoad: now };
+  cache = { lastLoad: now, rows: parsed, fuse };
 }
 
-// --- Rich chips ---
+/** =========================
+ *  RICH CONTENT HELPERS (Dialogflow Messenger)
+ *  ========================= */
+function rcDescription(title, lines = []) {
+  return { type: "description", title, text: lines };
+}
+
+function rcChips(options) {
+  return { type: "chips", options };
+}
+
+function makeOptionChip(text, eventName, parameters = {}) {
+  return {
+    text,
+    event: { name: eventName, languageCode: "vi", parameters },
+  };
+}
+
+function payloadRichContent(blocks) {
+  // blocks: array of arrays (each array = 1 column)
+  return { richContent: blocks };
+}
+
+/** =========================
+ *  BUILD RESPONSES
+ *  ========================= */
 function chipsForProcedures(list) {
   const options = list.slice(0, 8).map((r) => {
     const item = r.item || r;
-    return {
-      text: item.thu_tuc,
-      event: {
-        name: "CHON_THU_TUC",
-        languageCode: "vi",
-        parameters: { ma_thu_tuc: item.ma_thu_tuc },
-      },
-    };
+    return makeOptionChip(item.thu_tuc, "CHON_THU_TUC", {
+      ma_thu_tuc: item.ma_thu_tuc,
+    });
   });
-  return [{ type: "chips", options }];
+  // nút quay lại
+  options.push(makeOptionChip("🔙 Quay lại", "BACK_TO_START", {}));
+  return [rcChips(options)];
 }
 
 function chipsForInfo(proc) {
-  const defs = [
-    ["🗂️ Thành phần hồ sơ", "thanh_phan_hs"],
-    ["⏱️ Thời hạn giải quyết", "thoi_han"],
-    ["🧭 Trình tự thực hiện", "trinh_tu"],
-    ["💳 Phí, lệ phí", "phi_le_phi"],
-    ["📍 Nơi tiếp nhận", "noi_tiep_nhan"],
-    ["🏢 Cơ quan thực hiện", "co_quan_thuc_hien"],
-    ["👥 Đối tượng", "doi_tuong"],
-    ["📄 Kết quả", "ket_qua"],
-    ["⚖️ Căn cứ pháp lý", "can_cu"],
-    ["✅ Điều kiện", "dieu_kien"],
-    ["🌐 Hình thức nộp", "hinh_thuc_nop"],
-  ];
-  const options = defs
-    .filter(([, col]) => (proc[col] || "").trim().length)
-    .map(([label, col]) => ({
-      text: label,
-      event: {
-        name: "XEM_CHI_TIET_TTHC",
-        languageCode: "vi",
-        parameters: { ma_thu_tuc: proc.ma_thu_tuc, info_key: col },
-      },
-    }));
-  return [{ type: "chips", options }];
+  const options = DETAIL_COLS.filter((col) =>
+    String(proc[col] || "").trim().length
+  ).map((col) =>
+    makeOptionChip(INFO_KEY_TO_LABEL[col] || col, "XEM_CHI_TIET_TTHC", {
+      ma_thu_tuc: proc.ma_thu_tuc,
+      info_key: col,
+    })
+  );
+  // Nút quay lại danh sách thủ tục?
+  // Ở màn chi tiết thủ tục, “Quay lại” sẽ đưa về bảng chọn info của chính thủ tục
+  options.push(
+    makeOptionChip("🔙 Quay lại thủ tục", "BACK_TO_PROC", {
+      ma_thu_tuc: proc.ma_thu_tuc,
+    })
+  );
+  return [rcChips(options)];
 }
 
-// --- Webhook ---
+function startPromptBlocks() {
+  // Màn “bắt đầu” / fallback khi chưa hiểu
+  return [
+    rcDescription("❓Bạn muốn tra cứu thủ tục nào?", [
+      "Hãy nhập từ khóa (ví dụ: **chứng chỉ thẩm tra viên**, **cấp phép xây dựng**, ...)",
+      "Hoặc chọn ngay các gợi ý phổ biến bên dưới:",
+    ]),
+  ];
+}
+
+/** =========================
+ *  CORE LOGIC
+ *  ========================= */
+function findProcByMa(ma) {
+  return cache.rows.find((r) => r.ma_thu_tuc === ma);
+}
+
+function searchProcedures(qraw) {
+  const q = removeVietnameseTones(qraw || "");
+  if (!q) return [];
+  return cache.fuse.search(q);
+}
+
+function respondWithProcedures(res, results, title = "Gợi ý thủ tục phù hợp") {
+  const blocks = [
+    [
+      rcDescription(title, [
+        results.length
+          ? "Chọn một thủ tục bên dưới:"
+          : "Không tìm thấy thủ tục phù hợp. Bạn có thể thử từ khóa khác.",
+      ]),
+      ...chipsForProcedures(results.length ? results : cache.rows.slice(0, 8)),
+    ],
+  ];
+  return res.json({ fulfillmentMessages: [{ payload: payloadRichContent(blocks) }] });
+}
+
+function respondWithProcOverview(res, proc) {
+  const lines = [
+    `Lĩnh vực: ${proc.linh_vuc || "-"}`,
+    `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
+  ];
+  const blocks = [[rcDescription(`**${proc.thu_tuc}**`, lines), ...chipsForInfo(proc)]];
+  return res.json({ fulfillmentMessages: [{ payload: payloadRichContent(blocks) }] });
+}
+
+function respondWithProcDetail(res, proc, info_key) {
+  const label = INFO_KEY_TO_LABEL[info_key] || info_key;
+  const value = String(proc[info_key] || "").trim() || "Chưa có dữ liệu.";
+  const blocks = [
+    [
+      rcDescription(`**${proc.thu_tuc}**`, []),
+      rcDescription(`**${label.toUpperCase()}**`, [value]),
+      ...chipsForInfo(proc),
+    ],
+  ];
+  return res.json({ fulfillmentMessages: [{ payload: payloadRichContent(blocks) }] });
+}
+
+/** =========================
+ *  WEBHOOK
+ *  ========================= */
 app.post("/fulfillment", async (req, res) => {
   try {
     await loadSheet();
 
-    const body = req.body;
-    const params = _.get(body, "queryResult.parameters", {});
-    const queryText = _.get(body, "queryResult.queryText", "");
-    // Cách A: đọc theo entity đã thiết kế
-    const rawTTHC = (params.procedure_name || params["any"] || "").toString();
-    const infoRaw = (params.TTHC_Info || "").toString().toLowerCase();
-    const info_key = INFO_KEY_TO_COL[infoRaw] || infoRaw;
+    const body = req.body || {};
+    const qr = body.queryResult || {};
+    const params = qr.parameters || {};
+    const action = qr.action || "";
+    const queryText = qr.queryText || "";
 
-    const ev = _.get(body, "originalDetectIntentRequest.payload.event", null);
-    const evParams = ev?.parameters || {};
-    const chosenMa = evParams.ma_thu_tuc || params.ma_thu_tuc;
+    // Event từ chip (Dialogflow Messenger)
+    const event = _.get(body, "originalDetectIntentRequest.payload.event", null);
+    const evName = event?.name;
+    const evParams = event?.parameters || {};
 
-    let proc = null;
-
-    if (chosenMa) {
-      proc = cache.rows.find((r) => r.ma_thu_tuc === chosenMa);
-    } else {
-      const q = removeVietnameseTones(rawTTHC || queryText);
-      const results = cache.fuse.search(q);
-
-      if (!results.length || results[0].score > 0.42) {
-        const payload = {
-          richContent: [
-            [
-              {
-                type: "description",
-                title: "❓Bạn muốn tra cứu thủ tục nào?",
-                text: ["Chọn trong các gợi ý dưới đây:"],
-              },
-              ...chipsForProcedures(results.length ? results : cache.rows.slice(0, 8)),
-            ],
-          ],
-        };
-        return res.json({ fulfillmentMessages: [{ payload }] });
-      }
-      proc = results[0].item;
+    // ƯU TIÊN: xử lý theo event (chip)
+    if (evName === "CHON_THU_TUC") {
+      const proc = findProcByMa(evParams.ma_thu_tuc);
+      if (!proc) return respondWithProcedures(res, [], "Không tìm thấy thủ tục.");
+      return respondWithProcOverview(res, proc);
     }
 
-    const title = `**${proc.thu_tuc}**`;
-
-    if (!info_key || !COLUMN_MAP[info_key]) {
-      const payload = {
-        richContent: [
-          [
-            {
-              type: "description",
-              title: title,
-              text: [
-                `Lĩnh vực: ${proc.linh_vuc || "-"}`,
-                `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
-              ],
-            },
-            ...chipsForInfo(proc),
-          ],
-        ],
-      };
-      return res.json({ fulfillmentMessages: [{ payload }] });
+    if (evName === "XEM_CHI_TIET_TTHC") {
+      const proc = findProcByMa(evParams.ma_thu_tuc);
+      if (!proc) return respondWithProcedures(res, [], "Không tìm thấy thủ tục.");
+      const info_key = evParams.info_key;
+      return respondWithProcDetail(res, proc, info_key);
     }
 
-    const value = proc[info_key] || "Chưa có dữ liệu.";
-    const payload = {
-      richContent: [
-        [
-          { type: "description", title: title, text: [] },
-          {
-            type: "description",
-            title: `**${info_key.replaceAll("_", " ").toUpperCase()}**`,
-            text: [value],
-          },
-          ...chipsForInfo(proc),
-        ],
-      ],
-    };
-    return res.json({ fulfillmentMessages: [{ payload }] });
+    if (evName === "BACK_TO_PROC") {
+      const proc = findProcByMa(evParams.ma_thu_tuc);
+      if (!proc) return respondWithProcedures(res, [], "Không tìm thấy thủ tục.");
+      return respondWithProcOverview(res, proc);
+    }
+
+    if (evName === "BACK_TO_START") {
+      const blocks = [startPromptBlocks(), ...chipsForProcedures(cache.rows)];
+      return res.json({
+        fulfillmentMessages: [{ payload: payloadRichContent(blocks) }],
+      });
+    }
+
+    // Intent TRA_CUU_TU_KHOA (action = "keyword")
+    if (action === "keyword") {
+      const k = params.keyword || queryText || "";
+      const results = searchProcedures(k);
+      return respondWithProcedures(res, results, `Gợi ý cho: “${k}”`);
+    }
+
+    // Nếu không có action/event rõ ràng:
+    // 1) thử tìm theo queryText
+    if (queryText) {
+      const results = searchProcedures(queryText);
+      if (results.length) return respondWithProcedures(res, results, "Gợi ý thủ tục");
+    }
+
+    // 2) fallback về màn bắt đầu + gợi ý top
+    const blocks = [startPromptBlocks(), ...chipsForProcedures(cache.rows)];
+    return res.json({ fulfillmentMessages: [{ payload: payloadRichContent(blocks) }] });
   } catch (e) {
     console.error(e);
     return res.json({
       fulfillmentText:
-        "Xin lỗi, hệ thống đang gặp sự cố khi đọc dữ liệu. Vui lòng thử lại.",
+        "Xin lỗi, hệ thống đang gặp sự cố khi đọc dữ liệu. Vui lòng thử lại sau.",
     });
   }
 });
 
-// --- Health check + listen ---
 app.get("/", (_, res) => res.send("SXDSL TTHC Webhook OK"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("Listening on " + PORT));
-
+app.listen(PORT, () => console.log("Webhook listening on " + PORT));
