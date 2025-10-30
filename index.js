@@ -1,4 +1,3 @@
-
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
@@ -11,12 +10,17 @@ const SHEET_NAME = process.env.SHEET_NAME || "TTHC";
 const app = express();
 app.use(bodyParser.json());
 
+// --- Helpers ---
 const removeVietnameseTones = (str) => {
   if (!str) return "";
   return str
-    .normalize("NFD").replace(/[̀-\u036f]/g, "")
-    .replace(/đ/g, "d").replace(/Đ/g, "D")
-    .toLowerCase().replace(/\s+/g, " ").trim();
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // bỏ dấu
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 };
 
 let cache = { rows: [], fuse: null, lastLoad: 0 };
@@ -38,7 +42,7 @@ const COLUMN_MAP = {
   noi_tiep_nhan: "noi_tiep_nhan",
   ket_qua: "ket_qua",
   can_cu: "can_cu",
-  dieu_kien: "dieu_kien"
+  dieu_kien: "dieu_kien",
 };
 
 const INFO_KEY_TO_COL = {
@@ -58,27 +62,31 @@ const INFO_KEY_TO_COL = {
   hinh_thuc_nop: "hinh_thuc_nop",
   linh_vuc: "linh_vuc",
   cap_thuc_hien: "cap_thuc_hien",
-  loai_thu_tuc: "loai_thu_tuc"
+  loai_thu_tuc: "loai_thu_tuc",
 };
 
+// --- Load Google Sheet vào cache ---
 async function loadSheet() {
   const now = Date.now();
   if (now - cache.lastLoad < 5 * 60 * 1000 && cache.rows.length) return;
 
   const auth = await google.auth.getClient({
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
   const sheets = google.sheets({ version: "v4", auth });
 
   const range = `${SHEET_NAME}!A1:Q`;
   const { data } = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range
+    spreadsheetId: SHEET_ID,
+    range,
   });
 
   const [header, ...rows] = data.values || [];
   const idx = Object.fromEntries(header.map((h, i) => [h, i]));
   const toObj = (r) =>
-    Object.fromEntries(Object.keys(COLUMN_MAP).map((k) => [k, r[idx[k]] || ""]));
+    Object.fromEntries(
+      Object.keys(COLUMN_MAP).map((k) => [k, r?.[idx[k]] || ""])
+    );
 
   const parsed = rows.map(toObj).filter((r) => r.thu_tuc);
   parsed.forEach((r) => (r._thu_tuc_norm = removeVietnameseTones(r.thu_tuc)));
@@ -88,12 +96,13 @@ async function loadSheet() {
     includeScore: true,
     threshold: 0.42,
     ignoreLocation: true,
-    minMatchCharLength: 3
+    minMatchCharLength: 3,
   });
 
   cache = { rows: parsed, fuse, lastLoad: now };
 }
 
+// --- Rich chips ---
 function chipsForProcedures(list) {
   const options = list.slice(0, 8).map((r) => {
     const item = r.item || r;
@@ -102,8 +111,8 @@ function chipsForProcedures(list) {
       event: {
         name: "CHON_THU_TUC",
         languageCode: "vi",
-        parameters: { ma_thu_tuc: item.ma_thu_tuc }
-      }
+        parameters: { ma_thu_tuc: item.ma_thu_tuc },
+      },
     };
   });
   return [{ type: "chips", options }];
@@ -121,7 +130,7 @@ function chipsForInfo(proc) {
     ["📄 Kết quả", "ket_qua"],
     ["⚖️ Căn cứ pháp lý", "can_cu"],
     ["✅ Điều kiện", "dieu_kien"],
-    ["🌐 Hình thức nộp", "hinh_thuc_nop"]
+    ["🌐 Hình thức nộp", "hinh_thuc_nop"],
   ];
   const options = defs
     .filter(([, col]) => (proc[col] || "").trim().length)
@@ -130,12 +139,13 @@ function chipsForInfo(proc) {
       event: {
         name: "XEM_CHI_TIET_TTHC",
         languageCode: "vi",
-        parameters: { ma_thu_tuc: proc.ma_thu_tuc, info_key: col }
-      }
+        parameters: { ma_thu_tuc: proc.ma_thu_tuc, info_key: col },
+      },
     }));
   return [{ type: "chips", options }];
 }
 
+// --- Webhook ---
 app.post("/fulfillment", async (req, res) => {
   try {
     await loadSheet();
@@ -143,7 +153,7 @@ app.post("/fulfillment", async (req, res) => {
     const body = req.body;
     const params = _.get(body, "queryResult.parameters", {});
     const queryText = _.get(body, "queryResult.queryText", "");
-    // Read parameters as per your current Dialogflow intent (Cách A)
+    // Cách A: đọc theo entity đã thiết kế
     const rawTTHC = (params.procedure_name || params["any"] || "").toString();
     const infoRaw = (params.TTHC_Info || "").toString().toLowerCase();
     const info_key = INFO_KEY_TO_COL[infoRaw] || infoRaw;
@@ -162,12 +172,16 @@ app.post("/fulfillment", async (req, res) => {
 
       if (!results.length || results[0].score > 0.42) {
         const payload = {
-          richContent: [[
-            { type: "description",
-              title: "❓Bạn muốn tra cứu thủ tục nào?",
-              text: ["Chọn trong các gợi ý dưới đây:"] },
-            ...chipsForProcedures(results.length ? results : cache.rows.slice(0, 8))
-          ]]
+          richContent: [
+            [
+              {
+                type: "description",
+                title: "❓Bạn muốn tra cứu thủ tục nào?",
+                text: ["Chọn trong các gợi ý dưới đây:"],
+              },
+              ...chipsForProcedures(results.length ? results : cache.rows.slice(0, 8)),
+            ],
+          ],
         };
         return res.json({ fulfillmentMessages: [{ payload }] });
       }
@@ -178,36 +192,48 @@ app.post("/fulfillment", async (req, res) => {
 
     if (!info_key || !COLUMN_MAP[info_key]) {
       const payload = {
-        richContent: [[
-          { type: "description",
-            title: title,
-            text: [
-              `Lĩnh vực: ${proc.linh_vuc || "-"}`,
-              `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`
-            ] },
-          ...chipsForInfo(proc)
-        ]]
+        richContent: [
+          [
+            {
+              type: "description",
+              title: title,
+              text: [
+                `Lĩnh vực: ${proc.linh_vuc || "-"}`,
+                `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
+              ],
+            },
+            ...chipsForInfo(proc),
+          ],
+        ],
       };
       return res.json({ fulfillmentMessages: [{ payload }] });
     }
 
     const value = proc[info_key] || "Chưa có dữ liệu.";
     const payload = {
-      richContent: [[
-        { type: "description", title: title, text: [] },
-        { type: "description", title: `**${info_key.replaceAll("_", " ").toUpperCase()}**`, text: [value] },
-        ...chipsForInfo(proc)
-      ]]
+      richContent: [
+        [
+          { type: "description", title: title, text: [] },
+          {
+            type: "description",
+            title: `**${info_key.replaceAll("_", " ").toUpperCase()}**`,
+            text: [value],
+          },
+          ...chipsForInfo(proc),
+        ],
+      ],
     };
     return res.json({ fulfillmentMessages: [{ payload }] });
   } catch (e) {
     console.error(e);
     return res.json({
-      fulfillmentText: "Xin lỗi, hệ thống đang gặp sự cố khi đọc dữ liệu. Vui lòng thử lại."
+      fulfillmentText:
+        "Xin lỗi, hệ thống đang gặp sự cố khi đọc dữ liệu. Vui lòng thử lại.",
     });
   }
 });
 
+// --- Health check + listen ---
 app.get("/", (_, res) => res.send("SXDSL TTHC Webhook OK"));
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("Listening on " + PORT));
+
+const PORT = p
