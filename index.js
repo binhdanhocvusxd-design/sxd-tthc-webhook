@@ -236,4 +236,6 @@ app.post("/fulfillment", async (req, res) => {
 // --- Health check + listen ---
 app.get("/", (_, res) => res.send("SXDSL TTHC Webhook OK"));
 
-const PORT = p
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log("Listening on " + PORT));
+
