@@ -6,7 +6,7 @@ WORKDIR /usr/src/app
 COPY package*.json ./
 
 # cài deps (production), bỏ peer deps tránh lỗi build
-RUN npm ci --omit=dev --legacy-peer-deps
+RUN npm install --omit=dev --legacy-peer-deps
 
 # copy phần còn lại của mã nguồn
 COPY . .
