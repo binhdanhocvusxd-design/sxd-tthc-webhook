@@ -318,4 +318,4 @@ app.post("/fulfillment", async (req, res) => {
 app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("Webhook listening on port " + PORT));
+app.listen(PORT, "0.0.0.0", () => console.log("Webhook listening on " + PORT));
