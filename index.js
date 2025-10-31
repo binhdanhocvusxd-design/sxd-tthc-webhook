@@ -1,25 +1,37 @@
+// index.js — phiên bản đã tái cấu trúc theo “QUY TRÌNH HOẠT ĐỘNG”
+// Node 18.x
+
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 import Fuse from "fuse.js";
 import _ from "lodash";
 
-/** ====== CONFIG ====== **/
+/** ========== CẤU HÌNH BẢNG TTHC ========= **/
 const SHEET_ID = process.env.SHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "TTHC";
 
-/** ====== APP ====== **/
+/** ========== APP ========= **/
 const app = express();
 app.use(bodyParser.json());
 
-/** ====== UTILS ====== **/
-const vnNorm = (s) =>
-  (s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/đ/g, "d").replace(/Đ/g, "D")
-    .toLowerCase().replace(/\s+/g, " ").trim();
+/** ========== TIỆN ÍCH ========= **/
+const VN_NORM = (str) =>
+  (str || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 
-const COLS = {
+const TOKENIZE = (s) =>
+  VN_NORM(s)
+    .split(" ")
+    .filter((t) => t && t.length > 1); // bỏ token 1 ký tự
+
+const COLUMN_MAP = {
   ma_thu_tuc: "ma_thu_tuc",
   so_quyet_dinh: "so_quyet_dinh",
   thu_tuc: "thu_tuc",
@@ -39,12 +51,14 @@ const COLS = {
   dieu_kien: "dieu_kien",
 };
 
-const INFO_KEYS = {
-  trinh_tu: "trinh_tu",
+const INFO_KEY_TO_COL = {
+  thoi_gian: "thoi_han",
   thoi_han: "thoi_han",
+  trinh_tu: "trinh_tu",
   le_phi: "phi_le_phi",
   phi_le_phi: "phi_le_phi",
   thanh_phan_hs: "thanh_phan_hs",
+  ho_so: "thanh_phan_hs",
   doi_tuong: "doi_tuong",
   co_quan: "co_quan_thuc_hien",
   noi_nop: "noi_tiep_nhan",
@@ -57,12 +71,12 @@ const INFO_KEYS = {
   loai_thu_tuc: "loai_thu_tuc",
 };
 
-/** ====== CACHE + SHEET ====== **/
-let cache = { rows: [], fuse: null, last: 0 };
+let cache = { rows: [], lastLoad: 0, nameMap: new Map() };
 
+/** Đọc Google Sheet + tạo chỉ mục */
 async function loadSheet() {
   const now = Date.now();
-  if (cache.rows.length && now - cache.last < 5 * 60 * 1000) return;
+  if (now - cache.lastLoad < 5 * 60 * 1000 && cache.rows.length) return;
 
   const auth = await google.auth.getClient({
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
@@ -71,61 +85,79 @@ async function loadSheet() {
 
   const range = `${SHEET_NAME}!A1:Q`;
   const { data } = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID, range,
+    spreadsheetId: SHEET_ID,
+    range,
   });
 
   const [header, ...rows] = data.values || [];
   const idx = Object.fromEntries(header.map((h, i) => [h, i]));
   const toObj = (r) =>
-    Object.fromEntries(Object.keys(COLS).map((k) => [k, r[idx[k]] || ""]));
+    Object.fromEntries(Object.keys(COLUMN_MAP).map((k) => [k, r[idx[k]] || ""]));
 
   const parsed = rows.map(toObj).filter((r) => r.thu_tuc);
   parsed.forEach((r) => {
-    r._thu_tuc_norm = vnNorm(r.thu_tuc);
+    r._norm = VN_NORM(r.thu_tuc);
+    r._tokens = TOKENIZE(r.thu_tuc);
   });
 
-  const fuse = new Fuse(parsed, {
-    keys: ["thu_tuc", "_thu_tuc_norm"],
-    threshold: 0.44, // nới nhẹ để bao gần đúng
-    includeScore: true,
-    ignoreLocation: true,
-    minMatchCharLength: 3,
-  });
+  // Bản đồ “tên gốc → record” để nhận khi UI trả về text chip
+  const nameMap = new Map();
+  for (const r of parsed) {
+    nameMap.set(r.thu_tuc.trim(), r);
+  }
 
-  cache = { rows: parsed, fuse, last: now };
+  cache = { rows: parsed, lastLoad: now, nameMap };
 }
 
-const findByMa = (ma) => cache.rows.find((r) => r.ma_thu_tuc === ma);
+/** Tìm thủ tục theo truy vấn “AND-token” + chấm điểm độ phủ */
+function searchProcedures(qRaw, limit = 20) {
+  const tokens = TOKENIZE(qRaw);
+  if (!tokens.length) return [];
 
-/** ====== RENDER HELPERS (CCAI rich responses) ====== **/
-const desc = (title, textLines = []) => ({
-  type: "description",
-  title,
-  text: textLines,
-});
-
-const section = (title, text) => desc(`**${title}**`, [text || "Chưa có dữ liệu."]);
-
-function chips(items) {
-  return [{ type: "chips", options: items }];
+  const hits = [];
+  for (const r of cache.rows) {
+    // tất cả token đều phải hiện diện
+    const ok = tokens.every((t) => r._norm.includes(t));
+    if (!ok) continue;
+    // điểm = tổng chiều dài token trùng / chiều dài tên chuẩn hóa
+    const overlap =
+      tokens.reduce((sum, t) => sum + (r._norm.includes(t) ? t.length : 0), 0) /
+      Math.max(1, r._norm.length);
+    hits.push({ score: 1 - overlap, item: r }); // score nhỏ hơn = tốt hơn
+  }
+  hits.sort((a, b) => a.score - b.score);
+  return hits.slice(0, limit);
 }
 
-function chipsChonThuTuc(list) {
-  const opts = list.slice(0, 10).map((r) => {
+/** ======= UI helpers (Dialogflow Messenger richContent) ======= **/
+
+// 1) Danh sách thủ tục dạng LIST (đẹp cho tiêu đề dài)
+function listForProcedures(results, title = "**Gợi ý thủ tục**") {
+  const items = results.slice(0, 20).map((r) => {
     const item = r.item || r;
     return {
-      text: item.thu_tuc,
-      event: {
-        name: "CHON_THU_TUC",
-        languageCode: "vi",
-        parameters: { ma_thu_tuc: item.ma_thu_tuc },
-      },
+      type: "list",
+      title: item.thu_tuc, // người dùng click -> trả text = title
     };
   });
-  return chips(opts);
+  return {
+    fulfillmentMessages: [
+      {
+        payload: {
+          richContent: [
+            [
+              { type: "description", title, text: ["Chọn một thủ tục bên dưới:"] },
+              ...items,
+            ],
+          ],
+        },
+      },
+    ],
+  };
 }
 
-function chipsMenuThongTin(proc) {
+// 2) Menu chip chi tiết của một thủ tục (có Back + Hướng dẫn nộp)
+function chipsForInfo(proc) {
   const defs = [
     ["🗂️ Thành phần hồ sơ", "thanh_phan_hs"],
     ["⏱️ Thời hạn giải quyết", "thoi_han"],
@@ -138,297 +170,300 @@ function chipsMenuThongTin(proc) {
     ["⚖️ Căn cứ pháp lý", "can_cu"],
     ["✅ Điều kiện", "dieu_kien"],
     ["🌐 Hình thức nộp", "hinh_thuc_nop"],
+    ["📌 Hướng dẫn nộp TTHC", "_huongdan_"], // đặc biệt
   ];
-  const infoOpts = defs
-    .filter(([, k]) => (proc[k] || "").trim().length)
-    .map(([label, k]) => ({
+
+  const options = defs
+    .filter(([_, col]) => col === "_huongdan_" || (proc[col] || "").trim().length)
+    .map(([label, col]) => ({
       text: label,
       event: {
         name: "XEM_CHI_TIET_TTHC",
         languageCode: "vi",
-        parameters: { ma_thu_tuc: proc.ma_thu_tuc, info_key: k },
+        parameters: { ma_thu_tuc: proc.ma_thu_tuc, info_key: col },
       },
     }));
 
-  // “Hướng dẫn nộp TTHC”
-  infoOpts.push({
-    text: "📥 Hướng dẫn nộp thủ tục hành chính",
+  // nút Back
+  options.unshift({
+    text: "⬅️ Quay lại thủ tục",
     event: {
-      name: "HUONG_DAN_NOP",
+      name: "BACK_TO_MENU",
       languageCode: "vi",
       parameters: { ma_thu_tuc: proc.ma_thu_tuc },
     },
   });
 
-  return chips(infoOpts);
+  return {
+    payload: {
+      richContent: [[{ type: "chips", options }]],
+    },
+  };
 }
 
-function chipBack(ma) {
-  return chips([
-    {
-      text: "⬅️ Quay lại",
-      event: {
-        name: "BACK_TO_MENU",
-        languageCode: "vi",
-        parameters: { ma_thu_tuc: ma },
-      },
+/** Nội dung “Hướng dẫn nộp TTHC” */
+function huongDanNopCards() {
+  return {
+    payload: {
+      richContent: [
+        [
+          {
+            type: "description",
+            title: "Nộp trực tiếp",
+            text: [
+              "Nộp hồ sơ trực tiếp tại Bộ phận một cửa Sở Xây dựng Sơn La - Trung tâm Phục vụ hành chính công tỉnh.",
+              "Địa chỉ: Tầng 1, Toà nhà 7 tầng, Trung tâm Lưu trữ lịch sử tỉnh Sơn La (Khu Quảng trường Tây Bắc, phường Tô Hiệu, tỉnh Sơn La) hoặc Trung tâm phục vụ hành chính công xã, phường gần nhất.",
+            ],
+          },
+          {
+            type: "description",
+            title: "Dịch vụ bưu chính",
+            text: [
+              "Bạn có thể gửi hồ sơ / nhận kết quả qua bưu điện.",
+              "Các bước: 1) Chuẩn bị hồ sơ; 2) Đến bưu điện; 3) Chọn hình thức (gửi hồ sơ / nhận kết quả / cả hai); 4) Nhận kết quả tại địa chỉ đã đăng ký.",
+            ],
+          },
+          {
+            type: "description",
+            title: "Nộp hồ sơ trực tuyến",
+            text: [
+              "Truy cập: https://dichvucong.gov.vn/p/home/dvc-dich-vu-cong-truc-tuyen-ds.html?pCoQuanId=426103",
+              "Các bước (rút gọn): 1) Đăng nhập VNeID; 2) Tìm tên thủ tục; 3) Chọn cơ quan thực hiện; 4) Điền thông tin + đính kèm hồ sơ; 5) Chọn hình thức nhận kết quả; 6) Nộp lệ phí (nếu có); 7) Kiểm tra và hoàn tất.",
+              "Hướng dẫn chi tiết: https://binhdanhocvusxd.com/huongdansudungdichvuso/abc",
+            ],
+          },
+        ],
+      ],
     },
-  ]);
+  };
 }
 
-function renderHuongDanNop(mode) {
-  if (mode === "TRUC_TIEP") {
-    return [
-      desc("**Nộp trực tiếp**", [
-        "Nộp hồ sơ trực tiếp tại **Bộ phận một cửa Sở Xây dựng Sơn La** - Trung tâm Phục vụ hành chính công tỉnh.",
-        "Địa chỉ: **Tầng 1, Toà nhà 7 tầng, Trung tâm Lưu trữ lịch sử tỉnh Sơn La** (Khu Quảng trường Tây Bắc, phường Tô Hiệu, tỉnh Sơn La) **hoặc** Trung tâm phục vụ hành chính công xã, phường gần nhất.",
-      ]),
-    ];
-  }
-  if (mode === "BUU_CHINH") {
-    return [
-      desc("**Dịch vụ bưu chính**", [
-        "Bạn có thể gửi hồ sơ/nhận kết quả qua bưu điện.",
-        "Quy trình:",
-        "1) Chuẩn bị hồ sơ theo hướng dẫn của chatbot.",
-        "2) Đến bưu điện gần nhất.",
-        "3) Chọn: chỉ gửi hồ sơ / chỉ nhận kết quả / cả hai.",
-        "4) Nhân viên bưu điện chuyển hồ sơ đến cơ quan, sau khi giải quyết sẽ chuyển kết quả về địa chỉ của bạn.",
-      ]),
-    ];
-  }
-  if (mode === "TRUC_TUYEN") {
-    return [
-      desc("**Nộp hồ sơ trực tuyến**", [
-        "Truy cập: https://dichvucong.gov.vn/p/home/dvc-dich-vu-cong-truc-tuyen-ds.html?pCoQuanId=426103",
-        "Các bước tóm tắt:",
-        "1) Đăng nhập VNeID → Tìm tên thủ tục (như chatbot cung cấp).",
-        "2) Chọn tỉnh **Sơn La**, cơ quan **Sở Xây dựng Sơn La** (hoặc UBND xã/phường nếu phù hợp).",
-        "3) Nhập thông tin người thực hiện; **thành phần hồ sơ** theo chatbot hướng dẫn.",
-        "4) Chọn hình thức nhận kết quả.",
-        "5) Thanh toán lệ phí (nếu có) trực tuyến – mức phí xem trong chatbot hướng dẫn.",
-        "6) Kiểm tra và nộp hồ sơ.",
-      ]),
-    ];
-  }
-  // Màn chọn 3 phương thức
-  return chips([
-    {
-      text: "🏢 Nộp trực tiếp",
-      event: {
-        name: "HUONG_DAN_NOP",
-        languageCode: "vi",
-        parameters: { mode: "TRUC_TIEP" },
-      },
-    },
-    {
-      text: "📮 Dịch vụ bưu chính",
-      event: {
-        name: "HUONG_DAN_NOP",
-        languageCode: "vi",
-        parameters: { mode: "BUU_CHINH" },
-      },
-    },
-    {
-      text: "🌐 Nộp trực tuyến",
-      event: {
-        name: "HUONG_DAN_NOP",
-        languageCode: "vi",
-        parameters: { mode: "TRUC_TUYEN" },
-      },
-    },
-  ]);
-}
-
-/** ====== MAIN HANDLER ====== **/
+/** ======= XỬ LÝ CHÍNH ======= **/
 app.post("/fulfillment", async (req, res) => {
   try {
     await loadSheet();
 
     const body = req.body;
-    const intent = _.get(body, "queryResult.intent.displayName", "");
     const params = _.get(body, "queryResult.parameters", {});
-    const queryText = _.get(body, "queryResult.queryText", "");
+    const queryText = _.get(body, "queryResult.queryText", "").trim();
 
-    // EVENT payload (click từ chips)
-    const eventObj = _.get(
-      body,
-      "originalDetectIntentRequest.payload.event",
-      null
-    );
-    const eventName = eventObj?.name || "";
-    const eventParams = eventObj?.parameters || {};
+    // Kiểm tra event (khi click chip)
+    const ev = _.get(body, "originalDetectIntentRequest.payload.event", null);
+    const evName = ev?.name || "";
+    const evParams = ev?.parameters || {};
 
-    /** ===== Routing theo EVENT trước (ưu tiên chống lặp) ===== **/
-    if (eventName === "CHON_THU_TUC") {
-      const ma = eventParams.ma_thu_tuc;
-      const proc = findByMa(ma);
-      if (!proc) return res.json({ fulfillmentText: "Không tìm thấy thủ tục." });
+    /** ===== 1) SỰ KIỆN: CHỌN THỦ TỤC ===== */
+    if (evName === "CHON_THU_TUC") {
+      const ma = evParams.ma_thu_tuc?.toString() || "";
+      const proc = cache.rows.find((r) => r.ma_thu_tuc === ma);
+      if (!proc) return res.json(listForProcedures([])); // phòng hờ
 
-      const payload = {
-        richContent: [
-          [
-            desc(`**${proc.thu_tuc}**`, [
-              `Lĩnh vực: ${proc.linh_vuc || "-"}`,
-              `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
-            ]),
-            ...chipsMenuThongTin(proc),
+      const payload = chipsForInfo(proc);
+      const card = {
+        payload: {
+          richContent: [
+            [
+              {
+                type: "description",
+                title: `**${proc.thu_tuc}**`,
+                text: [
+                  `Lĩnh vực: ${proc.linh_vuc || "-"}`,
+                  `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
+                ],
+              },
+            ],
           ],
-        ],
+        },
       };
-      return res.json({ fulfillmentMessages: [{ payload }] });
+      return res.json({ fulfillmentMessages: [card, payload] });
     }
 
-    if (eventName === "XEM_CHI_TIET_TTHC") {
-      const ma = eventParams.ma_thu_tuc;
-      const key = eventParams.info_key;
-      const proc = findByMa(ma);
-      if (!proc) return res.json({ fulfillmentText: "Không tìm thấy thủ tục." });
+    /** ===== 2) SỰ KIỆN: XEM CHI TIẾT ===== */
+    if (evName === "XEM_CHI_TIET_TTHC") {
+      const ma = evParams.ma_thu_tuc?.toString() || "";
+      const infoKey = (evParams.info_key || "").toString();
+      const proc = cache.rows.find((r) => r.ma_thu_tuc === ma);
+      if (!proc) return res.json(listForProcedures([]));
 
-      const value = proc[key] || "Chưa có dữ liệu.";
-      const title = `**${proc.thu_tuc}**`;
-      const payload = {
-        richContent: [
-          [
-            desc(title, []),
-            section((key || "").replaceAll("_", " ").toUpperCase(), value),
-            ...chipsMenuThongTin(proc),
-            ...chipBack(proc.ma_thu_tuc),
-          ],
-        ],
-      };
-      return res.json({ fulfillmentMessages: [{ payload }] });
-    }
-
-    if (eventName === "BACK_TO_MENU") {
-      const ma = eventParams.ma_thu_tuc;
-      const proc = findByMa(ma);
-      if (!proc) return res.json({ fulfillmentText: "Không tìm thấy thủ tục." });
-      const payload = {
-        richContent: [
-          [
-            desc(`**${proc.thu_tuc}**`, [
-              `Lĩnh vực: ${proc.linh_vuc || "-"}`,
-              `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
-            ]),
-            ...chipsMenuThongTin(proc),
-          ],
-        ],
-      };
-      return res.json({ fulfillmentMessages: [{ payload }] });
-    }
-
-    if (eventName === "HUONG_DAN_NOP") {
-      const mode = eventParams.mode;
-      const payload = { richContent: [renderHuongDanNop(mode)] };
-      return res.json({ fulfillmentMessages: [{ payload }] });
-    }
-
-    /** ===== Routing theo INTENT ===== **/
-    // 1) Ý định keyword ngắn: TRA_CUU_TU_KHOA
-    if (intent === "TRA_CUU_TU_KHOA") {
-      const keyword = (params.keyword || queryText || "").toString();
-      const q = vnNorm(keyword);
-      const results = cache.fuse.search(q);
-      if (!results.length) {
-        // Thất bại -> nhắc chọn từ khoá khác
+      // Hướng dẫn nộp TTHC (đặc biệt)
+      if (infoKey === "_huongdan_") {
+        const title = { payload: { richContent: [[{ type: "description", title: `**${proc.thu_tuc}**`, text: [] }]] } };
         return res.json({
-          fulfillmentText:
-            "Mình chưa tìm thấy thủ tục phù hợp. Bạn thử gõ rõ hơn tên thủ tục nhé.",
+          fulfillmentMessages: [title, huongDanNopCards(), chipsForInfo(proc)],
         });
       }
-      // Trả chips chọn thủ tục
-      const payload = {
-        richContent: [
-          [
-            desc("**Gợi ý thủ tục**", ["Chọn một thủ tục bên dưới:"]),
-            ...chipsChonThuTuc(results),
+
+      const col = COLUMN_MAP[infoKey];
+      const value = (col && proc[col]) ? proc[col] : "Chưa có dữ liệu.";
+      const fm = {
+        payload: {
+          richContent: [
+            [
+              { type: "description", title: `**${proc.thu_tuc}**`, text: [] },
+              {
+                type: "description",
+                title: `**${infoKey.replaceAll("_", " ").toUpperCase()}**`,
+                text: [value],
+              },
+            ],
           ],
-        ],
+        },
       };
-      return res.json({ fulfillmentMessages: [{ payload }] });
+      return res.json({ fulfillmentMessages: [fm, chipsForInfo(proc)] });
     }
 
-    // 2) Ý định tự nhiên: TraCuuTTHC (+ follow-up)
-    if (intent === "TraCuuTTHC" || intent === "TraCuuTTHC - custom") {
-      const rawName =
-        (params.procedure_name || params.keyword || queryText || "").toString();
+    /** ===== 3) SỰ KIỆN: BACK ===== */
+    if (evName === "BACK_TO_MENU") {
+      const ma = evParams.ma_thu_tuc?.toString() || "";
+      const proc = cache.rows.find((r) => r.ma_thu_tuc === ma);
+      if (!proc) return res.json(listForProcedures([]));
+      const card = {
+        payload: {
+          richContent: [
+            [
+              {
+                type: "description",
+                title: `**${proc.thu_tuc}**`,
+                text: [
+                  `Lĩnh vực: ${proc.linh_vuc || "-"}`,
+                  `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
+                ],
+              },
+            ],
+          ],
+        },
+      };
+      return res.json({ fulfillmentMessages: [card, chipsForInfo(proc)] });
+    }
+
+    /** ===== 4) DÒ TEXT = NHÃN CHIP (phòng trường hợp UI không gửi event) ===== */
+    const exactProc = cache.nameMap.get(queryText);
+    if (exactProc) {
+      const card = {
+        payload: {
+          richContent: [
+            [
+              {
+                type: "description",
+                title: `**${exactProc.thu_tuc}**`,
+                text: [
+                  `Lĩnh vực: ${exactProc.linh_vuc || "-"}`,
+                  `Cấp thực hiện: ${exactProc.cap_thuc_hien || "-"}`,
+                ],
+              },
+            ],
+          ],
+        },
+      };
+      return res.json({ fulfillmentMessages: [card, chipsForInfo(exactProc)] });
+    }
+
+    /** ===== 5) XỬ LÝ Ý ĐỊNH TRA CỨU  ===== */
+    const intent = _.get(body, "queryResult.intent.displayName", "");
+    if (intent === "TraCuuTTHC") {
+      const rawProc = (params.procedure_name || "").toString();
       const infoRaw = (params.TTHC_Info || "").toString().toLowerCase();
+      const infoKey = INFO_KEY_TO_COL[infoRaw] || infoRaw;
 
-      const q = vnNorm(rawName);
+      // Tìm thủ tục theo text người dùng
       let proc = null;
+      if (rawProc) {
+        const best = searchProcedures(rawProc, 1);
+        if (best.length) proc = best[0].item;
+      } else if (queryText) {
+        const best = searchProcedures(queryText, 1);
+        if (best.length) proc = best[0].item;
+      }
 
-      if (q) {
-        const results = cache.fuse.search(q);
-        if (results.length && results[0].score <= 0.44) {
-          proc = results[0].item;
-        } else if (results.length > 1) {
-          // Trả gợi ý danh sách
-          const payload = {
+      if (!proc) {
+        const results = searchProcedures(queryText || rawProc);
+        if (!results.length) {
+          return res.json({
+            fulfillmentText:
+              "Mình chưa nhận ra thủ tục bạn cần. Bạn mô tả rõ hơn tên thủ tục nhé?",
+          });
+        }
+        return res.json(listForProcedures(results));
+      }
+
+      // Có info -> trả thẳng chi tiết (Lựa chọn 2)
+      if (infoKey && COLUMN_MAP[infoKey]) {
+        const value = proc[infoKey] || "Chưa có dữ liệu.";
+        const fm = {
+          payload: {
             richContent: [
               [
-                desc("**Gợi ý thủ tục**", ["Chọn một thủ tục bên dưới:"]),
-                ...chipsChonThuTuc(results),
+                { type: "description", title: `**${proc.thu_tuc}**`, text: [] },
+                {
+                  type: "description",
+                  title: `**${infoKey.replaceAll("_", " ").toUpperCase()}**`,
+                  text: [value],
+                },
               ],
             ],
-          };
-          return res.json({ fulfillmentMessages: [{ payload }] });
-        }
+          },
+        };
+        const chipXemThem = {
+          payload: {
+            richContent: [
+              [
+                {
+                  type: "chips",
+                  options: [
+                    {
+                      text: "Tìm hiểu thông tin khác về thủ tục này",
+                      event: {
+                        name: "BACK_TO_MENU",
+                        languageCode: "vi",
+                        parameters: { ma_thu_tuc: proc.ma_thu_tuc },
+                      },
+                    },
+                  ],
+                },
+              ],
+            ],
+          },
+        };
+        return res.json({ fulfillmentMessages: [fm, chipXemThem] });
       }
 
-      // Không xác định được thủ tục -> gợi ý chung
-      if (!proc) {
-        const sample = cache.rows.slice(0, 10).map((r) => ({ item: r }));
-        const payload = {
+      // Không có info -> menu chip chi tiết (Lựa chọn 1)
+      const card = {
+        payload: {
           richContent: [
             [
-              desc("**Gợi ý thủ tục**", ["Chọn một thủ tục bên dưới:"]),
-              ...chipsChonThuTuc(sample),
+              {
+                type: "description",
+                title: `**${proc.thu_tuc}**`,
+                text: [
+                  `Lĩnh vực: ${proc.linh_vuc || "-"}`,
+                  `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
+                ],
+              },
             ],
           ],
-        };
-        return res.json({ fulfillmentMessages: [{ payload }] });
-      }
-
-      // ĐÃ xác định thủ tục:
-      const title = `**${proc.thu_tuc}**`;
-
-      // Nếu có yêu cầu đi kèm (Lựa chọn 2): trả thẳng các thẻ dữ liệu tương ứng
-      const infoKey = INFO_KEYS[infoRaw] || infoRaw;
-      if (infoKey && COLS[infoKey]) {
-        const value = proc[infoKey] || "Chưa có dữ liệu.";
-        const payload = {
-          richContent: [
-            [
-              desc(title, []),
-              section(infoKey.replaceAll("_", " ").toUpperCase(), value),
-              ...chipsMenuThongTin(proc),
-              ...chipBack(proc.ma_thu_tuc),
-            ],
-          ],
-        };
-        return res.json({ fulfillmentMessages: [{ payload }] });
-      }
-
-      // Nếu hỏi chung (Lựa chọn 1): trả menu info (chips)
-      const payload = {
-        richContent: [
-          [
-            desc(title, [
-              `Lĩnh vực: ${proc.linh_vuc || "-"}`,
-              `Cấp thực hiện: ${proc.cap_thuc_hien || "-"}`,
-            ]),
-            ...chipsMenuThongTin(proc),
-          ],
-        ],
+        },
       };
-      return res.json({ fulfillmentMessages: [{ payload }] });
+      return res.json({ fulfillmentMessages: [card, chipsForInfo(proc)] });
+    }
+
+    if (intent === "TRA_CUU_TU_KHOA" || intent === "Default Fallback Intent") {
+      // Với keyword ngắn → gợi ý danh sách (lọc chặt)
+      const base = params.keyword?.toString() || queryText;
+      const results = searchProcedures(base);
+      if (!results.length) {
+        return res.json({
+          fulfillmentText:
+            "Mình chưa nhận ra thủ tục bạn cần. Bạn mô tả rõ hơn tên thủ tục nhé?",
+        });
+      }
+      return res.json(listForProcedures(results));
     }
 
     // Mặc định
     return res.json({
       fulfillmentText:
-        "Mình chưa hiểu ý bạn. Bạn có thể nói rõ tên thủ tục (vd: cấp giấy phép xây dựng)…",
+        "Xin lỗi, hệ thống đang bận. Bạn thử hỏi lại tên thủ tục nhé!",
     });
   } catch (e) {
     console.error(e);
