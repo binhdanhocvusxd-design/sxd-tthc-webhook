@@ -158,7 +158,10 @@ function listWithSelect(procs){
     event: { name:'EVT_SELECT_PROCEDURE', languageCode:'vi', parameters:{ procedure_idx: p.idx, procedure_name: p.name } }
   }));
 }
-function dfPayload(blocks){ return { payload:{ richContent: blocks } }; }
+function dfPayload(blocks) {
+  // blocks là 1 mảng các component => cần bọc thêm 1 lớp []
+  return { payload: { richContent: [ blocks ] } };
+}
 function dfText(text){ return { text:{ text:[text] } }; }
 function dfOutput(msgs=[]){ return { fulfillmentMessages: msgs }; }
 function setCtx(session, name, lifespan, params){ return { name:`${session}/contexts/${name}`, lifespanCount: lifespan, parameters: params||{} }; }
